@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.matthew.meeting-followup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/matthewdivincenzo/.meeting-followup/meeting_followup.py</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ANTHROPIC_API_KEY</key>
+        <string>YOUR_ANTHROPIC_API_KEY</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <!-- Trigger when Granola cache file is modified (i.e., meeting ends) -->
+    <key>WatchPaths</key>
+    <array>
+        <string>/Users/matthewdivincenzo/Library/Application Support/Granola/cache-v3.json</string>
+    </array>
+
+    <!-- Throttle: don't fire more than once every 30 seconds -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/matthewdivincenzo/.meeting-followup/launchagent-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/matthewdivincenzo/.meeting-followup/launchagent-stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

@@ -1,0 +1,7 @@
+*.log
+state.json
+token.json
+credentials.json
+*.pyc
+__pycache__/
+.env
