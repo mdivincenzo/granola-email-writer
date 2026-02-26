@@ -38,6 +38,7 @@ from urllib.error import HTTPError, URLError
 GRANOLA_CACHE = Path.home() / "Library" / "Application Support" / "Granola" / "cache-v3.json"
 GRANOLA_AUTH = Path.home() / "Library" / "Application Support" / "Granola" / "supabase.json"
 GRANOLA_PANELS_URL = "https://api.granola.ai/v1/get-document-panels"
+GRANOLA_TRANSCRIPT_URL = "https://api.granola.ai/v1/get-document-transcript"
 
 STATE_FILE = Path.home() / ".meeting-followup" / "state.json"
 LOG_FILE = Path.home() / ".meeting-followup" / "followup.log"
@@ -322,6 +323,65 @@ def fetch_panels(meeting_id, token):
         return None
 
 
+def fetch_transcript(meeting_id, token):
+    """Fetch the full meeting transcript from Granola API."""
+    try:
+        req = Request(
+            GRANOLA_TRANSCRIPT_URL,
+            data=json.dumps({"document_id": meeting_id}).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept-Encoding": "gzip",
+            },
+        )
+        resp = urlopen(req, timeout=30)
+        raw = resp.read()
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        segments = json.loads(raw)
+        return segments
+    except HTTPError as e:
+        log.error("Transcript API HTTP error %d: %s", e.code, e.reason)
+        return None
+    except URLError as e:
+        log.error("Transcript API connection error: %s", e.reason)
+        return None
+    except Exception as e:
+        log.error("Transcript API unexpected error: %s", e)
+        return None
+
+
+def format_transcript(segments):
+    """Convert transcript segments into readable text with speaker labels."""
+    if not segments or not isinstance(segments, list):
+        return ""
+    lines = []
+    last_speaker = None
+    current_text = []
+
+    for seg in segments:
+        # source: "microphone" = you, "system" = them
+        speaker = "Me" if seg.get("source") == "microphone" else "Them"
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+
+        if speaker == last_speaker:
+            current_text.append(text)
+        else:
+            if current_text and last_speaker:
+                lines.append(f"{last_speaker}: {' '.join(current_text)}")
+            current_text = [text]
+            last_speaker = speaker
+
+    # Flush last speaker
+    if current_text and last_speaker:
+        lines.append(f"{last_speaker}: {' '.join(current_text)}")
+
+    return "\n".join(lines)
+
+
 def extract_panel_text(content):
     """Recursively extract text from ProseMirror JSON content blocks."""
     if not content or not isinstance(content, dict):
@@ -388,7 +448,8 @@ def panels_to_notes(panels):
 
 
 def fetch_panels_with_retry(meeting_id, token):
-    """Poll Granola API until panels are ready or timeout is reached."""
+    """Poll Granola API until panels are ready or timeout is reached.
+    Also fetches transcript once panels are ready."""
     elapsed = 0
     while elapsed < PANEL_POLL_MAX_WAIT:
         panels = fetch_panels(meeting_id, token)
@@ -396,7 +457,20 @@ def fetch_panels_with_retry(meeting_id, token):
             notes_text = panels_to_notes(panels)
             if len(notes_text.strip()) >= PANEL_MIN_CHARS:
                 log.info("Panels ready: %d chars after %ds", len(notes_text), elapsed)
-                return notes_text
+                # Now fetch transcript
+                transcript_text = ""
+                segments = fetch_transcript(meeting_id, token)
+                if segments:
+                    transcript_text = format_transcript(segments)
+                    log.info("Transcript fetched: %d chars", len(transcript_text))
+                else:
+                    log.warning("Transcript not available — using panels only")
+                # Combine: transcript first (primary source), panels as summary
+                combined = ""
+                if transcript_text:
+                    combined += "TRANSCRIPT:\n" + transcript_text + "\n\n"
+                combined += "AI NOTES:\n" + notes_text
+                return combined
             else:
                 log.info("Panels exist but too short (%d chars) — waiting...",
                          len(notes_text.strip()))
@@ -412,7 +486,15 @@ def fetch_panels_with_retry(meeting_id, token):
         notes_text = panels_to_notes(panels)
         if len(notes_text.strip()) >= PANEL_MIN_CHARS:
             log.info("Panels ready on final attempt: %d chars", len(notes_text))
-            return notes_text
+            transcript_text = ""
+            segments = fetch_transcript(meeting_id, token)
+            if segments:
+                transcript_text = format_transcript(segments)
+            combined = ""
+            if transcript_text:
+                combined += "TRANSCRIPT:\n" + transcript_text + "\n\n"
+            combined += "AI NOTES:\n" + notes_text
+            return combined
 
     log.warning("Panels not ready after %ds", PANEL_POLL_MAX_WAIT)
     return None
@@ -590,59 +672,41 @@ MEETING DETAILS:
 MEETING CONTENT:
 {notes}
 
-INSTRUCTIONS:
+HARD RULES — VIOLATING ANY OF THESE MEANS THE EMAIL IS WRONG:
 
-Using the full meeting transcript and notes, draft a follow-up email. The email should read like something a sharp, senior seller would actually send. It should lock in commitments, demonstrate you listened, and move the deal or relationship forward.
+1. TOTAL LENGTH: 4-8 sentences. No exceptions. Count them. If it's 9, cut one.
 
-OVERALL LENGTH: The entire email body should be 4-8 sentences. That's it. If you've written more than 8 sentences, you've written too much. Cut aggressively. A great follow-up is a tight note, not a memo.
+2. NEVER RE-EXPLAIN WHAT WAS DISCUSSED. Both parties were on the call. Reference decisions, don't restate them.
+   BAD: "glad we landed on a draw-against-commission structure as a way to create more predictable upside for you while giving Rokt some downside protection"
+   GOOD: "glad we landed on the draw-against-commission approach"
 
-Subject line: Always use "re: our call today (Rokt)" as the subject line. No exceptions.
+3. MAX 1-2 ACTION ITEMS. Not a list. Not every follow-up discussed. Only the ones that need to be written down.
+   BAD: "keep at HEB, Publix, Lululemon and any Expo West brands that feel like strong fits"
+   GOOD: pick the single most important next step and reference only that
+   BAD: "If you hear of someone, let me know" (assigns discovery to them when you own it)
+   GOOD: "If we identify someone, I'll loop you in" (assigns discovery to Rokt)
 
-Opening: Lead with what matters to them.
-Always begin the email with "Hi [first name]," on its own line, followed by a blank line. The next line should begin with "Great speaking earlier" then transition into reflecting back the most important problem, goal, or priority they articulated during the call. Use labeling where it fits naturally. Phrases like "it sounds like," "it seems like," or "the sense I got" signal that you were listening and invite them to confirm or correct. This builds trust and pulls them into the email.
-Adapt the tone to the relationship. For a first or early-stage conversation, the opening should demonstrate that you understood their situation. For an ongoing client relationship, skip the "prove I was listening" framing and get to the point. Not every email needs to open the same way.
-Do not add any additional greeting or thank-you beyond "Hi [first name]," and "Great speaking earlier." No "thanks for your time" or "great chatting today."
+4. NO FLATTERY. No "you've put a huge amount of effort." No "rightly focused." No "I really appreciated." Reference specifics from the call, not adjectives about the person.
 
-Recap: What we aligned on.
-ONE sentence max. Reference the decision or direction, do not re-explain it. Both parties were on the call. If you discussed a deal structure, say "glad we landed on the draw-against-commission approach" not a full paragraph re-teaching how it works. The recap should feel like a nod, not a briefing document. Only include things that were actually discussed and agreed upon. Do not invent commitments, deliverables, or workstreams that were not explicitly mentioned in the transcript.
+5. NO THANK-YOUS. Not "thanks for sending." Not "thanks for your time." Not "appreciate you." Zero.
 
-Commitments: Who is doing what.
-Pick only the 1-2 most important next steps. Skip anything both parties will obviously remember from the conversation. A follow-up email is not a meeting transcript or CRM log. If there were five action items discussed, include the one or two that actually need to be written down to move things forward, and drop the rest. Assign every action to the correct person based on what was actually said in the transcript. This is critical: if the prospect said "send me some times," the action belongs to Rokt, not the prospect. Misattributing an action item destroys credibility. Read the transcript carefully and get this right. If no clear commitments were made by either side, propose a reasonable next action rather than fabricating one.
-Write commitments inline in prose. No headers like "From our side" / "From your side." No bullet points for action items. Weave them into the body naturally.
+6. NO EMDASHES. Use commas or periods.
 
-Value add (when appropriate): One thing they didn't ask for.
-If the conversation surfaced a challenge, question, or priority where a relevant insight, resource, case study, or data point would genuinely help, include it. This should deepen their thinking or give your champion ammunition to sell internally, not be a product pitch.
-CRITICAL: You may only reference real, specific resources, articles, case studies, or data points that were explicitly mentioned during the call or that you know with certainty to be real. Never fabricate a case study, statistic, or anecdote. If you cannot cite something specific and real, skip this section entirely.
-This is not mandatory for every email. Skip it on routine syncs, quick check-ins, or calls where the next steps are purely operational. Forcing a value-add into an email that doesn't need one makes the email feel bloated and performative. Default to skipping it. Only include it when you have something genuinely useful and real to offer.
+7. NEVER FABRICATE. No case studies, stats, or resources that weren't explicitly mentioned on the call. If you can't cite something real, skip the value-add entirely. Default to skipping it.
 
-Close: Make it easy to move forward.
-End with a concrete next step. Default to calibrated, open-ended questions that give the recipient ownership over the answer. "What does your schedule look like early next week?" pulls a better response than "Does Tuesday at 2pm work?" because it invites collaboration instead of demanding a yes or no.
-The closing call to action MUST always be on its own line, separated by a line break from the preceding text. Never append it to the end of another sentence or paragraph.
-Avoid vague closers like "let me know your thoughts," "happy to chat further," or "looking forward to your availability."
+STRUCTURE:
 
-Tone and style rules:
-Write like a human being talking to another human being. The email should sound like it was written by the person who was actually on the call, not generated by software.
-Conversational and confident. Peer to peer, not vendor to buyer.
-Use their name, their company name, and the names of people referenced on the call.
-Keep it concise. If a sentence doesn't move the conversation forward, cut it.
-Use labeling ("it sounds like," "it seems like") naturally where it reinforces a key point. Do not overuse it. One label per email is usually enough.
-Never use emdashes. Use commas, periods, or restructure the sentence instead.
-Never use AI-style contrasting syntax like "it's not X, it's Y" or "this isn't a summary, it's a commitment device." Just say what it is. Don't define things by what they're not.
-Never use pandering or performative language like "honestly, I was genuinely impressed" or "I have to say, that was a really great point." No flattery that sounds like it came from a chatbot. If something from the call was noteworthy, reference it with specificity, not adjectives.
-Avoid jargon, filler, and anything that sounds templated.
+Subject: Always use "re: our call today (Rokt)" as the subject line. No exceptions.
 
-Formatting rules:
-Minimize bullet points. Default to prose. Use bullets only when listing 3+ concrete action items or deliverables, never for recapping discussion topics.
-Minimize line breaks and white space. The email should feel like a tight, well-written note, not a document with sections and headers.
-No section headers in the email itself (no "Key Discussion Points:" or "Action Items:" labels). These make the email feel like a template, not a message.
-No bolding within the email body unless absolutely necessary for a date or deadline.
-The entire email should be scannable in under 60 seconds. If it feels long, it is long. Cut it.
+Opening: "Hi [first name]," on its own line, then blank line, then "Great speaking earlier" followed by ONE observation that reflects back their priority. Use labeling naturally ("it sounds like," "the sense I got"). One label max. Adapt tone to relationship stage.
 
-Accuracy rules:
-Only reference things that were actually said in the transcript. Do not infer, assume, or embellish.
-Attribute action items to the correct person. Re-read the relevant portion of the transcript before assigning ownership.
-Do not invent deliverables, frameworks, or workstreams that were not discussed. If the agreed next step is simply "have another call," that's the next step. Don't manufacture additional commitments to make the email look more substantive.
-If the transcript is vague or ambiguous about who owns a next step, default to Rokt owning it. It is always better to offer to do something than to incorrectly tell the prospect they volunteered for it.
+Recap: ONE sentence referencing what was decided. A nod, not a briefing.
+
+Commitments: 1-2 next steps woven into prose. Attribute correctly — if they said "send me times," that's YOUR action, not theirs.
+
+Close: Concrete next step on its own line. Use a calibrated question ("What does your schedule look like...") not a vague closer.
+
+TONE: Conversational, confident, peer-to-peer. Use names and company names from the call. Every sentence must move things forward. If it doesn't, delete it.
 
 Sign off with "Best," then "{sender_name}".
 
