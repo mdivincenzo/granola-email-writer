@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Follow-Up</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #09090b;
+    color: #e4e4e7;
+    font-family: -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .container {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 24px 20px;
+  }
+
+  /* Header */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 20px;
+  }
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .health-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .health-dot.ok { background: #22c55e; box-shadow: 0 0 8px #22c55e40; }
+  .health-dot.error { background: #ef4444; box-shadow: 0 0 8px #ef444440; }
+  .health-dot.warning { background: #eab308; box-shadow: 0 0 8px #eab30840; }
+  .header-text h1 {
+    font-size: 18px;
+    font-weight: 600;
+    color: #fafafa;
+  }
+  .header-text .subtitle {
+    font-size: 12px;
+    color: #71717a;
+  }
+  .refresh-btn {
+    background: none;
+    border: 1px solid #27272a;
+    border-radius: 8px;
+    color: #a1a1aa;
+    font-size: 16px;
+    width: 36px;
+    height: 36px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+  }
+  .refresh-btn:hover {
+    background: #18181b;
+    color: #e4e4e7;
+    border-color: #3f3f46;
+  }
+  .refresh-btn.spinning {
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+
+  /* Stats bar */
+  .stats {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .stat {
+    background: #111116;
+    border: 1px solid #1e1e24;
+    border-radius: 10px;
+    padding: 12px 16px;
+    flex: 1;
+    text-align: center;
+  }
+  .stat-value {
+    font-size: 24px;
+    font-weight: 700;
+    color: #fafafa;
+  }
+  .stat-label {
+    font-size: 11px;
+    color: #71717a;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 2px;
+  }
+  .stat-value.green { color: #22c55e; }
+  .stat-value.red { color: #ef4444; }
+  .stat-value.yellow { color: #eab308; }
+
+  /* Tabs */
+  .tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 20px;
+    background: #111116;
+    border-radius: 10px;
+    padding: 4px;
+    border: 1px solid #1e1e24;
+  }
+  .tab {
+    flex: 1;
+    padding: 8px 16px;
+    text-align: center;
+    border-radius: 7px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    color: #71717a;
+    transition: all 0.2s;
+    border: none;
+    background: none;
+  }
+  .tab:hover { color: #a1a1aa; }
+  .tab.active {
+    background: #27272a;
+    color: #fafafa;
+  }
+
+  /* Activity tab */
+  .date-group {
+    margin-bottom: 16px;
+  }
+  .date-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: #52525b;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    padding: 0 4px;
+    margin-bottom: 8px;
+  }
+  .event-card {
+    background: #111116;
+    border: 1px solid #1e1e24;
+    border-radius: 10px;
+    margin-bottom: 6px;
+    overflow: hidden;
+    transition: border-color 0.2s;
+  }
+  .event-card:hover {
+    border-color: #27272a;
+  }
+  .event-row {
+    display: flex;
+    align-items: center;
+    padding: 12px 16px;
+    cursor: pointer;
+    gap: 12px;
+  }
+  .event-icon {
+    font-size: 14px;
+    width: 20px;
+    text-align: center;
+    flex-shrink: 0;
+  }
+  .event-title {
+    flex: 1;
+    font-size: 13px;
+    color: #d4d4d8;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .event-time {
+    font-size: 12px;
+    color: #52525b;
+    flex-shrink: 0;
+  }
+  .event-details {
+    display: none;
+    padding: 0 16px 12px 48px;
+    font-size: 12px;
+    color: #71717a;
+    line-height: 1.8;
+  }
+  .event-details.open {
+    display: block;
+  }
+  .detail-row {
+    display: flex;
+    gap: 8px;
+  }
+  .detail-label {
+    color: #52525b;
+    min-width: 80px;
+  }
+  .detail-value {
+    color: #a1a1aa;
+    word-break: break-all;
+  }
+
+  /* Type-specific colors for event icons */
+  .type-success .event-icon { color: #22c55e; }
+  .type-failed .event-icon { color: #ef4444; }
+  .type-deferred .event-icon { color: #eab308; }
+  .type-skipped .event-icon { color: #52525b; }
+  .type-trigger .event-icon { color: #3b82f6; }
+
+  /* Health tab */
+  .health-card {
+    background: #111116;
+    border: 1px solid #1e1e24;
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .health-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .health-name {
+    font-size: 13px;
+    color: #d4d4d8;
+    font-weight: 500;
+  }
+  .health-detail {
+    font-size: 12px;
+    color: #71717a;
+    margin-top: 2px;
+  }
+  .health-pill {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 12px;
+    letter-spacing: 0.3px;
+    flex-shrink: 0;
+  }
+  .health-pill.upper {
+    text-transform: uppercase;
+  }
+  .health-pill.ok {
+    background: #052e16;
+    color: #22c55e;
+    border: 1px solid #14532d;
+  }
+  .health-pill.error {
+    background: #450a0a;
+    color: #ef4444;
+    border: 1px solid #7f1d1d;
+  }
+  .health-pill.warning {
+    background: #422006;
+    color: #eab308;
+    border: 1px solid #713f12;
+  }
+
+  /* Health check icon */
+  .health-icon {
+    font-size: 18px;
+    width: 24px;
+    text-align: center;
+    flex-shrink: 0;
+  }
+
+  /* Empty state */
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: #52525b;
+  }
+  .empty-state .icon {
+    font-size: 48px;
+    margin-bottom: 16px;
+    opacity: 0.4;
+  }
+  .empty-state p {
+    font-size: 14px;
+    line-height: 1.6;
+  }
+
+  /* Tab panels */
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  /* Config section in health tab */
+  .config-section {
+    margin-top: 20px;
+  }
+  .config-section .date-label {
+    margin-bottom: 8px;
+  }
+  .config-card {
+    background: #111116;
+    border: 1px solid #1e1e24;
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .config-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 0;
+    font-size: 12px;
+  }
+  .config-key { color: #52525b; }
+  .config-val { color: #a1a1aa; font-family: "SF Mono", monospace; font-size: 11px; }
+</style>
+</head>
+<body>
+<script>
+  let STATUS_DATA = __STATUS_DATA_PLACEHOLDER__;
+</script>
+
+<div class="container" id="app"></div>
+
+<script>
+(function() {
+  // --- Helpers ---
+  function formatTime(isoStr) {
+    if (!isoStr) return "";
+    var d = new Date(isoStr);
+    var h = d.getHours();
+    var m = d.getMinutes();
+    var ampm = h >= 12 ? "PM" : "AM";
+    h = h % 12 || 12;
+    return h + ":" + (m < 10 ? "0" : "") + m + " " + ampm;
+  }
+
+  function formatRelativeDate(isoStr) {
+    if (!isoStr) return "Never";
+    var d = new Date(isoStr);
+    var now = new Date();
+    var today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    var eventDay = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    var diff = Math.floor((today - eventDay) / 86400000);
+    if (diff === 0) return "Today " + formatTime(isoStr);
+    if (diff === 1) return "Yesterday " + formatTime(isoStr);
+    var months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    return months[d.getMonth()] + " " + d.getDate() + " " + formatTime(isoStr);
+  }
+
+  function getDateGroup(isoStr) {
+    if (!isoStr) return "Unknown";
+    var d = new Date(isoStr);
+    var now = new Date();
+    var today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    var eventDay = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    var diff = Math.floor((today - eventDay) / 86400000);
+    if (diff === 0) return "Today";
+    if (diff === 1) return "Yesterday";
+    var months = ["January","February","March","April","May","June",
+                  "July","August","September","October","November","December"];
+    if (d.getFullYear() === now.getFullYear()) {
+      return months[d.getMonth()] + " " + d.getDate();
+    }
+    return months[d.getMonth()] + " " + d.getDate() + ", " + d.getFullYear();
+  }
+
+  function eventIcon(type) {
+    switch(type) {
+      case "success": return "\u2713";
+      case "failed": return "\u2717";
+      case "deferred": return "\u23F3";
+      case "skipped": return "\u2013";
+      case "trigger": return "\u26A1";
+      default: return "\u2022";
+    }
+  }
+
+  function overallHealth(health) {
+    if (!health || Object.keys(health).length === 0) return "warning";
+    for (var key in health) {
+      if (health[key].status === "error") return "error";
+    }
+    for (var key in health) {
+      if (health[key].status === "warning") return "warning";
+    }
+    return "ok";
+  }
+
+  function healthIcon(name) {
+    var icons = {
+      launchagent: "\u2699\uFE0F",
+      granola_cache: "\uD83D\uDCC1",
+      granola_token: "\uD83D\uDD11",
+      gmail_creds: "\u2709\uFE0F",
+      anthropic_key: "\uD83E\uDD16",
+      lock_file: "\uD83D\uDD12"
+    };
+    return icons[name] || "\u2022";
+  }
+
+  function healthLabel(name) {
+    var labels = {
+      launchagent: "LaunchAgent",
+      granola_cache: "Last Meeting Recorded",
+      granola_token: "Granola Token",
+      gmail_creds: "Gmail Credentials",
+      anthropic_key: "Anthropic API Key",
+      lock_file: "Lock File"
+    };
+    return labels[name] || name;
+  }
+
+  // Some health checks show their detail as the pill text instead of "ok"
+  var PILL_USES_DETAIL = { granola_cache: true };
+
+  // --- Render ---
+  function render(data) {
+    var app = document.getElementById("app");
+    var health = data.health || {};
+    var events = data.events || [];
+    var config = data.config || {};
+    var status = overallHealth(health);
+
+    // Compute stats from events (not trigger events)
+    var stats = { success: 0, failed: 0, deferred: 0, skipped: 0 };
+    events.forEach(function(e) {
+      if (e.type in stats) stats[e.type]++;
+    });
+
+    // Sort events by timestamp descending
+    events.sort(function(a, b) {
+      return (b.timestamp || "").localeCompare(a.timestamp || "");
+    });
+
+    // Group events by date
+    var groups = {};
+    var groupOrder = [];
+    events.forEach(function(e) {
+      var group = getDateGroup(e.timestamp);
+      if (!groups[group]) {
+        groups[group] = [];
+        groupOrder.push(group);
+      }
+      groups[group].push(e);
+    });
+
+    var html = "";
+
+    // Header
+    html += '<div class="header">';
+    html += '  <div class="header-left">';
+    html += '    <div class="health-dot ' + status + '"></div>';
+    html += '    <div class="header-text">';
+    html += '      <h1>Automatic</h1>';
+    html += '      <div class="subtitle">Last run: ' + formatRelativeDate(data.last_updated) + '<br>developed by: divo</div>';
+    html += '    </div>';
+    html += '  </div>';
+    html += '  <button class="refresh-btn" id="refreshBtn" title="Refresh">\u21BB</button>';
+    html += '</div>';
+
+    // Stats
+    html += '<div class="stats">';
+    html += '  <div class="stat"><div class="stat-value green">' + stats.success + '</div><div class="stat-label">Drafts</div></div>';
+    html += '  <div class="stat"><div class="stat-value red">' + stats.failed + '</div><div class="stat-label">Failed</div></div>';
+    html += '  <div class="stat"><div class="stat-value yellow">' + stats.deferred + '</div><div class="stat-label">Deferred</div></div>';
+    html += '  <div class="stat"><div class="stat-value">' + stats.skipped + '</div><div class="stat-label">Skipped</div></div>';
+    html += '</div>';
+
+    // Tabs
+    html += '<div class="tabs">';
+    html += '  <button class="tab active" data-tab="activity">Activity</button>';
+    html += '  <button class="tab" data-tab="health">Health</button>';
+    html += '</div>';
+
+    // Activity panel
+    html += '<div class="tab-panel active" id="tab-activity">';
+    if (events.length === 0) {
+      html += '<div class="empty-state">';
+      html += '  <div class="icon">\u2709\uFE0F</div>';
+      html += '  <p>No events yet.<br>The system will record activity after your next external meeting.</p>';
+      html += '</div>';
+    } else {
+      groupOrder.forEach(function(groupName) {
+        html += '<div class="date-group">';
+        html += '  <div class="date-label">' + groupName + '</div>';
+        groups[groupName].forEach(function(e, idx) {
+          var cardId = "event-" + (e.id || idx);
+          html += '<div class="event-card type-' + e.type + '">';
+          html += '  <div class="event-row" data-target="' + cardId + '">';
+          html += '    <div class="event-icon">' + eventIcon(e.type) + '</div>';
+          html += '    <div class="event-title">' + escapeHtml(e.title || e.detail || e.type) + '</div>';
+          html += '    <div class="event-time">' + formatTime(e.timestamp) + '</div>';
+          html += '  </div>';
+          html += '  <div class="event-details" id="' + cardId + '">';
+          html += renderEventDetails(e);
+          html += '  </div>';
+          html += '</div>';
+        });
+        html += '</div>';
+      });
+    }
+    html += '</div>';
+
+    // Health panel
+    html += '<div class="tab-panel" id="tab-health">';
+    if (Object.keys(health).length === 0) {
+      html += '<div class="empty-state">';
+      html += '  <div class="icon">\uD83D\uDCCA</div>';
+      html += '  <p>No health data yet.<br>Health checks run each time the pipeline triggers.</p>';
+      html += '</div>';
+    } else {
+      var healthOrder = ["launchagent", "granola_cache", "granola_token",
+                         "gmail_creds", "anthropic_key", "lock_file"];
+      healthOrder.forEach(function(key) {
+        if (!health[key]) return;
+        var h = health[key];
+        var useDetail = PILL_USES_DETAIL[key] && h.status === "ok";
+        var pillText = useDetail ? h.detail : h.status;
+        var pillClass = "health-pill " + h.status + (useDetail ? "" : " upper");
+        html += '<div class="health-card">';
+        html += '  <div class="health-left">';
+        html += '    <div class="health-icon">' + healthIcon(key) + '</div>';
+        html += '    <div>';
+        html += '      <div class="health-name">' + healthLabel(key) + '</div>';
+        if (!useDetail && h.detail) {
+          html += '      <div class="health-detail">' + escapeHtml(h.detail) + '</div>';
+        }
+        html += '    </div>';
+        html += '  </div>';
+        html += '  <div class="' + pillClass + '">' + escapeHtml(pillText) + '</div>';
+        html += '</div>';
+      });
+    }
+
+    // Config section
+    if (Object.keys(config).length > 0) {
+      html += '<div class="config-section">';
+      html += '  <div class="date-label">Configuration</div>';
+      html += '  <div class="config-card">';
+      for (var key in config) {
+        html += '<div class="config-row">';
+        html += '  <span class="config-key">' + escapeHtml(key) + '</span>';
+        html += '  <span class="config-val">' + escapeHtml(String(config[key])) + '</span>';
+        html += '</div>';
+      }
+      html += '  </div>';
+      html += '</div>';
+    }
+    html += '</div>';
+
+    app.innerHTML = html;
+    bindEvents();
+  }
+
+  function renderEventDetails(e) {
+    var rows = [];
+    if (e.type) rows.push(["Type", e.type]);
+    if (e.meeting_id) rows.push(["Meeting ID", e.meeting_id]);
+    if (e.to && e.to.length) rows.push(["To", e.to.join(", ")]);
+    if (e.cc && e.cc.length) rows.push(["CC", e.cc.join(", ")]);
+    if (e.subject) rows.push(["Subject", e.subject]);
+    if (e.reason) rows.push(["Reason", e.reason]);
+    if (e.detail) rows.push(["Detail", e.detail]);
+    if (e.transcript_chars) rows.push(["Transcript", e.transcript_chars.toLocaleString() + " chars"]);
+    if (e.gmail_context_chars) rows.push(["Gmail context", e.gmail_context_chars.toLocaleString() + " chars"]);
+    if (e.generation_time_sec) rows.push(["Generation", e.generation_time_sec + "s"]);
+    if (e.draft_id) rows.push(["Draft ID", e.draft_id]);
+
+    var html = "";
+    rows.forEach(function(r) {
+      html += '<div class="detail-row">';
+      html += '  <span class="detail-label">' + r[0] + '</span>';
+      html += '  <span class="detail-value">' + escapeHtml(r[1]) + '</span>';
+      html += '</div>';
+    });
+    return html;
+  }
+
+  function escapeHtml(str) {
+    if (!str) return "";
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  // --- Event binding ---
+  function bindEvents() {
+    // Expand/collapse event details
+    document.querySelectorAll(".event-row").forEach(function(row) {
+      row.addEventListener("click", function() {
+        var target = document.getElementById(this.getAttribute("data-target"));
+        if (target) target.classList.toggle("open");
+      });
+    });
+
+    // Tab switching
+    document.querySelectorAll(".tab").forEach(function(tab) {
+      tab.addEventListener("click", function() {
+        document.querySelectorAll(".tab").forEach(function(t) { t.classList.remove("active"); });
+        document.querySelectorAll(".tab-panel").forEach(function(p) { p.classList.remove("active"); });
+        this.classList.add("active");
+        var panel = document.getElementById("tab-" + this.getAttribute("data-tab"));
+        if (panel) panel.classList.add("active");
+      });
+    });
+
+    // Refresh button
+    var btn = document.getElementById("refreshBtn");
+    if (btn) {
+      btn.addEventListener("click", function() {
+        btn.classList.add("spinning");
+        // Try pywebview API first, fall back to page reload
+        if (window.pywebview && window.pywebview.api) {
+          window.pywebview.api.refresh().then(function(newData) {
+            STATUS_DATA = newData;
+            render(STATUS_DATA);
+          }).catch(function() {
+            btn.classList.remove("spinning");
+          });
+        } else {
+          // Browser fallback: reload the page
+          setTimeout(function() {
+            location.reload();
+          }, 300);
+        }
+      });
+    }
+  }
+
+  // Wait for pywebview ready event if available, otherwise render immediately
+  function init() {
+    render(STATUS_DATA);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+</script>
+</body>
+</html>

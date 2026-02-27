@@ -1,0 +1,4 @@
+#!/bin/bash
+# Launch the Follow-Up status viewer using system Python
+DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
+/usr/bin/python3 "$DIR/app.py"
