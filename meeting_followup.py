@@ -5,24 +5,23 @@ Automatic Meeting Follow-Up Email Drafter
 Triggered by LaunchAgent when Granola cache updates.
 
 Architecture:
-- Cache file:    Detect meetings + get meeting ID & attendees
-- Granola API:   Fetch AI-generated panels (notes/summary) via local auth token
+- Cache file:    TRIGGER ONLY + meeting metadata (IDs, attendees, dates)
+- Granola API:   Fetch AI-generated panels (notes/summary) + transcript
 - Claude API:    Generate follow-up email draft
 - Gmail API:     Push draft to Gmail
 
-v2 improvements:
-- Processes ALL unprocessed recent external meetings (not just the latest)
-- Refreshes expired Granola tokens automatically
-- Lock file prevents duplicate runs from concurrent triggers
-- Deferred retry queue for meetings whose panels aren't ready yet
-- Uses Claude Sonnet for higher-quality email output
-- macOS notifications on success and failure
+v3 improvements over v2:
+- Resilient cache parsing: handles v3 (JSON string), v4+ (native dict), and
+  auto-discovers cache files so Granola version upgrades don't break the script
+- Cache is treated as a metadata source only — all content from API
+- Better None-safety throughout calendar event parsing
 """
 
 import json
 import os
 import sys
 import time
+import glob
 import gzip
 import fcntl
 import logging
@@ -35,8 +34,8 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-GRANOLA_CACHE = Path.home() / "Library" / "Application Support" / "Granola" / "cache-v3.json"
-GRANOLA_AUTH = Path.home() / "Library" / "Application Support" / "Granola" / "supabase.json"
+GRANOLA_DATA_DIR = Path.home() / "Library" / "Application Support" / "Granola"
+GRANOLA_AUTH = GRANOLA_DATA_DIR / "supabase.json"
 GRANOLA_PANELS_URL = "https://api.granola.ai/v1/get-document-panels"
 GRANOLA_TRANSCRIPT_URL = "https://api.granola.ai/v1/get-document-transcript"
 
@@ -56,7 +55,11 @@ PANEL_POLL_MAX_WAIT = 300  # max seconds to wait (5 minutes)
 PANEL_MIN_CHARS = 50       # minimum content length to consider panels "ready"
 
 # Meeting age window
-MEETING_MAX_AGE_HOURS = 3  # process meetings up to this old
+MEETING_MAX_AGE_HOURS = 8  # process meetings up to this old
+
+# Gmail context (Layer 2): pull recent email history with external contacts
+GMAIL_LOOKBACK_DAYS = 365  # search up to 12 months back
+GMAIL_MAX_MESSAGES = 20    # cap at 20 messages per contact
 
 # ---------------------------------------------------------------------------
 # LOGGING
@@ -79,7 +82,6 @@ log = logging.getLogger(__name__)
 def notify(title, message, sound="default"):
     """Send a macOS notification via osascript."""
     try:
-        # Escape double quotes in message and title
         safe_title = title.replace('"', '\\"')
         safe_msg = message.replace('"', '\\"')
         script = (
@@ -161,7 +163,6 @@ def mark_processed(meeting_id):
     if meeting_id not in state["processed_meeting_ids"]:
         state["processed_meeting_ids"].append(meeting_id)
     state["processed_meeting_ids"] = state["processed_meeting_ids"][-200:]
-    # Remove from deferred if present
     if meeting_id in state.get("deferred_meeting_ids", []):
         state["deferred_meeting_ids"].remove(meeting_id)
     state["last_run"] = datetime.now().isoformat()
@@ -194,7 +195,12 @@ def get_granola_token():
         return None
     try:
         data = json.loads(GRANOLA_AUTH.read_text())
-        tokens = json.loads(data.get("workos_tokens", "{}"))
+        wt = data.get("workos_tokens", "{}")
+        # Handle both string (older) and dict (newer) formats
+        if isinstance(wt, str):
+            tokens = json.loads(wt)
+        else:
+            tokens = wt
         token = tokens.get("access_token")
         if not token:
             log.error("No access_token in Granola auth file")
@@ -206,22 +212,21 @@ def get_granola_token():
 
 
 def refresh_granola_token():
-    """Attempt to refresh the Granola token using the stored refresh_token.
-
-    Granola uses WorkOS under the hood. If direct refresh fails, we notify
-    the user to open Granola (which triggers a token refresh automatically).
-    """
+    """Attempt to refresh the Granola token using the stored refresh_token."""
     if not GRANOLA_AUTH.exists():
         return None
     try:
         data = json.loads(GRANOLA_AUTH.read_text())
-        tokens = json.loads(data.get("workos_tokens", "{}"))
+        wt = data.get("workos_tokens", "{}")
+        if isinstance(wt, str):
+            tokens = json.loads(wt)
+        else:
+            tokens = wt
         refresh_token = tokens.get("refresh_token")
         if not refresh_token:
             log.warning("No refresh_token available")
             return None
 
-        # Attempt WorkOS-style token refresh
         req = Request(
             "https://api.workos.com/user_management/authenticate",
             data=json.dumps({
@@ -241,7 +246,11 @@ def refresh_granola_token():
             tokens["access_token"] = new_tokens["access_token"]
             if "refresh_token" in new_tokens:
                 tokens["refresh_token"] = new_tokens["refresh_token"]
-            data["workos_tokens"] = json.dumps(tokens)
+            # Write back in whatever format it was stored
+            if isinstance(data.get("workos_tokens"), str):
+                data["workos_tokens"] = json.dumps(tokens)
+            else:
+                data["workos_tokens"] = tokens
             GRANOLA_AUTH.write_text(json.dumps(data))
             log.info("Granola token refreshed successfully")
             return new_tokens["access_token"]
@@ -264,7 +273,7 @@ def get_valid_granola_token():
             GRANOLA_PANELS_URL,
             data=json.dumps({"document_id": "00000000-0000-0000-0000-000000000000"}).encode(),
             headers={
-                "Authorization": f"Bearer {token}",
+                "Authorization": "Bearer %s" % token,
                 "Content-Type": "application/json",
             },
         )
@@ -284,15 +293,13 @@ def get_valid_granola_token():
             log.error("Granola token expired and refresh failed. Open Granola to re-authenticate.")
             return None
         else:
-            # Non-auth error (404, 400, etc.) means token is fine
             return token
     except Exception:
-        # Network error — assume token is ok, let actual request handle it
         return token
 
 
 # ---------------------------------------------------------------------------
-# GRANOLA API: Fetch panels
+# GRANOLA API: Fetch panels + transcript
 # ---------------------------------------------------------------------------
 def fetch_panels(meeting_id, token):
     """Fetch AI-generated panels from Granola API for a given meeting ID."""
@@ -301,7 +308,7 @@ def fetch_panels(meeting_id, token):
             GRANOLA_PANELS_URL,
             data=json.dumps({"document_id": meeting_id}).encode(),
             headers={
-                "Authorization": f"Bearer {token}",
+                "Authorization": "Bearer %s" % token,
                 "Content-Type": "application/json",
                 "Accept-Encoding": "gzip",
             },
@@ -310,8 +317,7 @@ def fetch_panels(meeting_id, token):
         raw = resp.read()
         if raw[:2] == b"\x1f\x8b":
             raw = gzip.decompress(raw)
-        panels = json.loads(raw)
-        return panels
+        return json.loads(raw)
     except HTTPError as e:
         log.error("Granola API HTTP error %d: %s", e.code, e.reason)
         return None
@@ -330,7 +336,7 @@ def fetch_transcript(meeting_id, token):
             GRANOLA_TRANSCRIPT_URL,
             data=json.dumps({"document_id": meeting_id}).encode(),
             headers={
-                "Authorization": f"Bearer {token}",
+                "Authorization": "Bearer %s" % token,
                 "Content-Type": "application/json",
                 "Accept-Encoding": "gzip",
             },
@@ -339,8 +345,7 @@ def fetch_transcript(meeting_id, token):
         raw = resp.read()
         if raw[:2] == b"\x1f\x8b":
             raw = gzip.decompress(raw)
-        segments = json.loads(raw)
-        return segments
+        return json.loads(raw)
     except HTTPError as e:
         log.error("Transcript API HTTP error %d: %s", e.code, e.reason)
         return None
@@ -352,32 +357,46 @@ def fetch_transcript(meeting_id, token):
         return None
 
 
-def format_transcript(segments):
-    """Convert transcript segments into readable text with speaker labels."""
+def format_transcript(segments, my_name="Me", their_name="Them"):
+    """Convert transcript segments into readable text with real speaker names.
+
+    Requires two audio sources (microphone + system) for accurate labeling.
+    Returns empty string if only one source is detected (e.g. speakerphone).
+
+    Args:
+        segments: list of transcript segments from Granola API
+        my_name: name for microphone source (the Granola user)
+        their_name: name for system source (the other participant)
+    """
     if not segments or not isinstance(segments, list):
         return ""
+
+    # Require two audio sources — single source means we can't label speakers
+    sources = set(seg.get("source", "") for seg in segments if seg.get("text", "").strip())
+    if len(sources) < 2:
+        log.warning("Only one audio source detected (%s) — likely speakerphone. "
+                     "Cannot label speakers accurately.", sources)
+        return ""
+
     lines = []
     last_speaker = None
     current_text = []
 
     for seg in segments:
-        # source: "microphone" = you, "system" = them
-        speaker = "Me" if seg.get("source") == "microphone" else "Them"
+        speaker = my_name if seg.get("source") == "microphone" else their_name
         text = seg.get("text", "").strip()
         if not text:
             continue
-
         if speaker == last_speaker:
             current_text.append(text)
         else:
             if current_text and last_speaker:
-                lines.append(f"{last_speaker}: {' '.join(current_text)}")
+                lines.append("%s: %s" % (last_speaker, " ".join(current_text)))
             current_text = [text]
             last_speaker = speaker
 
-    # Flush last speaker
     if current_text and last_speaker:
-        lines.append(f"{last_speaker}: {' '.join(current_text)}")
+        lines.append("%s: %s" % (last_speaker, " ".join(current_text)))
 
     return "\n".join(lines)
 
@@ -407,7 +426,7 @@ def extract_panel_text(content):
             for i, li in enumerate(block.get("content", []), 1):
                 li_text = _inline_text(li)
                 if li_text.strip():
-                    parts.append(f"{i}. " + li_text.strip() + "\n")
+                    parts.append("%d. %s\n" % (i, li_text.strip()))
 
         elif block_type == "paragraph":
             para_text = _inline_text(block)
@@ -443,34 +462,41 @@ def panels_to_notes(panels):
         content = panel.get("content", {})
         text = extract_panel_text(content)
         if text.strip():
-            all_notes.append(f"{title}:\n{text}")
+            all_notes.append("%s:\n%s" % (title, text))
     return "\n\n".join(all_notes)
 
 
-def fetch_panels_with_retry(meeting_id, token):
-    """Poll Granola API until panels are ready or timeout is reached.
-    Also fetches transcript once panels are ready."""
+def fetch_panels_with_retry(meeting_id, token, my_name="Me", their_name="Them"):
+    """Poll Granola API until meeting is processed, then fetch transcript.
+
+    Panels are used ONLY as a readiness signal (Granola has finished processing).
+    Only the labeled transcript is returned. If speaker separation is unavailable
+    (e.g. speakerphone), returns None to skip the meeting.
+
+    Returns:
+        transcript text string, or None if unavailable/unlabeled
+    """
     elapsed = 0
     while elapsed < PANEL_POLL_MAX_WAIT:
         panels = fetch_panels(meeting_id, token)
         if panels:
             notes_text = panels_to_notes(panels)
             if len(notes_text.strip()) >= PANEL_MIN_CHARS:
-                log.info("Panels ready: %d chars after %ds", len(notes_text), elapsed)
-                # Now fetch transcript
-                transcript_text = ""
+                log.info("Panels ready (readiness signal): %d chars after %ds",
+                         len(notes_text), elapsed)
                 segments = fetch_transcript(meeting_id, token)
                 if segments:
-                    transcript_text = format_transcript(segments)
-                    log.info("Transcript fetched: %d chars", len(transcript_text))
+                    transcript_text = format_transcript(segments, my_name, their_name)
+                    if transcript_text.strip():
+                        log.info("Transcript fetched: %d chars", len(transcript_text))
+                        return "TRANSCRIPT:\n" + transcript_text
+                    else:
+                        log.warning("Transcript has no speaker separation "
+                                    "(speakerphone?) — skipping")
+                        return None
                 else:
-                    log.warning("Transcript not available — using panels only")
-                # Combine: transcript first (primary source), panels as summary
-                combined = ""
-                if transcript_text:
-                    combined += "TRANSCRIPT:\n" + transcript_text + "\n\n"
-                combined += "AI NOTES:\n" + notes_text
-                return combined
+                    log.warning("Transcript not available")
+                    return None
             else:
                 log.info("Panels exist but too short (%d chars) — waiting...",
                          len(notes_text.strip()))
@@ -485,50 +511,112 @@ def fetch_panels_with_retry(meeting_id, token):
     if panels:
         notes_text = panels_to_notes(panels)
         if len(notes_text.strip()) >= PANEL_MIN_CHARS:
-            log.info("Panels ready on final attempt: %d chars", len(notes_text))
-            transcript_text = ""
+            log.info("Panels ready on final attempt")
             segments = fetch_transcript(meeting_id, token)
             if segments:
-                transcript_text = format_transcript(segments)
-            combined = ""
-            if transcript_text:
-                combined += "TRANSCRIPT:\n" + transcript_text + "\n\n"
-            combined += "AI NOTES:\n" + notes_text
-            return combined
+                transcript_text = format_transcript(segments, my_name, their_name)
+                if transcript_text.strip():
+                    return "TRANSCRIPT:\n" + transcript_text
 
-    log.warning("Panels not ready after %ds", PANEL_POLL_MAX_WAIT)
+    log.warning("Meeting not ready after %ds", PANEL_POLL_MAX_WAIT)
     return None
 
 
 # ---------------------------------------------------------------------------
-# CACHE: Detect meetings + get metadata
+# CACHE: Auto-discover + resilient parsing (metadata only)
 # ---------------------------------------------------------------------------
+def find_granola_cache():
+    """Auto-discover the latest Granola cache file (cache-v3, v4, v5, etc.)."""
+    pattern = str(GRANOLA_DATA_DIR / "cache-v*.json")
+    candidates = glob.glob(pattern)
+    if not candidates:
+        log.error("No Granola cache file found matching %s", pattern)
+        return None
+    # Sort by version number descending — pick the highest
+    def version_key(path):
+        try:
+            fname = os.path.basename(path)
+            # Extract number from "cache-v4.json" -> 4
+            return int(fname.replace("cache-v", "").replace(".json", ""))
+        except (ValueError, IndexError):
+            return 0
+    candidates.sort(key=version_key, reverse=True)
+    chosen = candidates[0]
+    log.info("Using cache file: %s", chosen)
+    return Path(chosen)
+
+
 def parse_cache():
-    if not GRANOLA_CACHE.exists():
-        log.error("Granola cache not found at %s", GRANOLA_CACHE)
+    """Parse the Granola cache file, handling both string and dict formats.
+
+    This is ONLY used for meeting metadata (IDs, attendees, dates).
+    All actual content (notes, transcript) comes from the Granola API.
+    """
+    cache_path = find_granola_cache()
+    if not cache_path or not cache_path.exists():
+        log.error("Granola cache not found")
         return None
     try:
-        raw = json.loads(GRANOLA_CACHE.read_text())
-        inner = json.loads(raw["cache"])
-        return inner["state"]
-    except (json.JSONDecodeError, KeyError) as e:
+        raw = json.loads(cache_path.read_text())
+        cache_val = raw.get("cache")
+        if cache_val is None:
+            log.error("No 'cache' key in cache file")
+            return None
+
+        # v3 format: cache is a JSON string that needs double-parsing
+        # v4+ format: cache is already a dict
+        if isinstance(cache_val, str):
+            inner = json.loads(cache_val)
+        elif isinstance(cache_val, dict):
+            inner = cache_val
+        else:
+            log.error("Unexpected cache format: %s", type(cache_val).__name__)
+            return None
+
+        # The state can be at inner["state"] or directly in inner
+        if "state" in inner:
+            return inner["state"]
+        elif "documents" in inner:
+            # Fallback: documents directly in inner
+            return inner
+        else:
+            log.error("No 'state' or 'documents' key in cache. Keys: %s",
+                      list(inner.keys())[:10])
+            return None
+
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
         log.error("Failed to parse Granola cache: %s", e)
         return None
+
+
+def _safe_get_nested(d, *keys, default=None):
+    """Safely traverse nested dicts where any value could be None."""
+    current = d
+    for key in keys:
+        if not isinstance(current, dict):
+            return default
+        current = current.get(key)
+        if current is None:
+            return default
+    return current
 
 
 def get_meeting_date(doc):
     """Extract the meeting start datetime, falling back to created_at."""
     try:
-        gcal = doc.get("google_calendar_event") or {}
-        start = gcal.get("start", {}).get("dateTime", "")
+        start = _safe_get_nested(doc, "google_calendar_event", "start", "dateTime",
+                                 default="")
         if start:
             return datetime.fromisoformat(start)
     except (ValueError, TypeError):
         pass
     try:
-        return datetime.fromisoformat((doc.get("created_at") or "").replace("Z", "+00:00"))
+        created = (doc.get("created_at") or "").replace("Z", "+00:00")
+        if created:
+            return datetime.fromisoformat(created)
     except (ValueError, TypeError):
-        return datetime.min.replace(tzinfo=timezone.utc)
+        pass
+    return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def get_recent_meetings(cache_state):
@@ -550,7 +638,6 @@ def get_recent_meetings(cache_state):
             meeting_time = meeting_time.replace(tzinfo=timezone.utc)
         if meeting_time < cutoff:
             continue
-        # Only include if meeting time is in the past (meeting has ended)
         if meeting_time > now:
             continue
         doc_id = doc.get("id", "")
@@ -575,7 +662,6 @@ def get_deferred_meeting_docs(cache_state):
     for mid in deferred_ids:
         if already_processed(mid):
             continue
-        # Search by id field
         for d in documents.values():
             if d.get("id") == mid:
                 docs.append(d)
@@ -591,10 +677,11 @@ def get_deferred_meeting_docs(cache_state):
 def extract_meeting_metadata(doc):
     """Extract meeting ID, title, date, and attendees from cache document."""
     gcal = doc.get("google_calendar_event") or {}
-    start = gcal.get("start", {}).get("dateTime", doc.get("created_at", ""))
+    start_dt = _safe_get_nested(gcal, "start", "dateTime", default="")
+    start = start_dt or doc.get("created_at", "")
 
     attendees = []
-    for att in gcal.get("attendees", []):
+    for att in (gcal.get("attendees") or []):
         email = att.get("email", "")
         if email.startswith("c_") and "@resource.calendar.google.com" in email:
             continue
@@ -642,7 +729,8 @@ def get_recipients(attendees):
 # ---------------------------------------------------------------------------
 # CLAUDE API
 # ---------------------------------------------------------------------------
-def generate_followup_email(meeting_data, recipients, sender_name="Matthew"):
+def generate_followup_email(meeting_data, recipients, sender_name="Matthew",
+                            gmail_context=""):
     try:
         import anthropic
     except ImportError:
@@ -661,63 +749,105 @@ def generate_followup_email(meeting_data, recipients, sender_name="Matthew"):
     except (ValueError, TypeError):
         date_str = meeting_data["date"]
 
-    prompt = """You are {sender_name}, a senior sales leader at Rokt. You just got off a call and are writing a follow-up email.
+    gmail_section = ""
+    if gmail_context:
+        gmail_section = (
+            "EMAIL HISTORY (recent correspondence with this contact):\n"
+            "{gmail_ctx}\n\n"
+            "Use the email history to:\n"
+            "- Adapt tone to the relationship stage (many emails = established, few = newer)\n"
+            "- Reference real follow-ups that happened between meetings (not guessed)\n"
+            "- Note threads where you sent something and got no reply (stalled)\n"
+            "- NEVER claim an email was sent if it's not in the history\n"
+            "- NEVER claim someone didn't reply if there's no outbound to begin with\n"
+            "- Do NOT rehash email content in the follow-up. The history is context for YOU, "
+            "not material to quote.\n\n"
+        ).format(gmail_ctx=gmail_context)
 
-MEETING DETAILS:
-- Title: {title}
-- Date: {date}
-- To (external): {to}
-- CC (internal Rokt): {cc}
+    # Determine if there's recent email history (for subject line logic)
+    has_recent_history = False
+    if gmail_context:
+        # Check if there's email activity in last 30 days
+        import re
+        # Look for date patterns in gmail context like "Feb 15" — crude but effective
+        month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        now = datetime.now()
+        thirty_days_ago = now - timedelta(days=30)
+        for month in month_names:
+            if month in gmail_context:
+                has_recent_history = True
+                break
 
-MEETING CONTENT:
-{notes}
-
-HARD RULES — VIOLATING ANY OF THESE MEANS THE EMAIL IS WRONG:
-
-1. TOTAL LENGTH: 4-8 sentences. No exceptions. Count them. If it's 9, cut one.
-
-2. NEVER RE-EXPLAIN WHAT WAS DISCUSSED. Both parties were on the call. Reference decisions, don't restate them.
-   BAD: "glad we landed on a draw-against-commission structure as a way to create more predictable upside for you while giving Rokt some downside protection"
-   GOOD: "glad we landed on the draw-against-commission approach"
-
-3. MAX 1-2 ACTION ITEMS. Not a list. Not every follow-up discussed. Only the ones that need to be written down.
-   BAD: "keep at HEB, Publix, Lululemon and any Expo West brands that feel like strong fits"
-   GOOD: pick the single most important next step and reference only that
-   BAD: "If you hear of someone, let me know" (assigns discovery to them when you own it)
-   GOOD: "If we identify someone, I'll loop you in" (assigns discovery to Rokt)
-
-4. NO FLATTERY. No "you've put a huge amount of effort." No "rightly focused." No "I really appreciated." Reference specifics from the call, not adjectives about the person.
-
-5. NO THANK-YOUS. Not "thanks for sending." Not "thanks for your time." Not "appreciate you." Zero.
-
-6. NO EMDASHES. Use commas or periods.
-
-7. NEVER FABRICATE. No case studies, stats, or resources that weren't explicitly mentioned on the call. If you can't cite something real, skip the value-add entirely. Default to skipping it.
-
-STRUCTURE:
-
-Subject: Always use "re: our call today (Rokt)" as the subject line. No exceptions.
-
-Opening: "Hi [first name]," on its own line, then blank line, then "Great speaking earlier" followed by ONE observation that reflects back their priority. Use labeling naturally ("it sounds like," "the sense I got"). One label max. Adapt tone to relationship stage.
-
-Recap: ONE sentence referencing what was decided. A nod, not a briefing.
-
-Commitments: 1-2 next steps woven into prose. Attribute correctly — if they said "send me times," that's YOUR action, not theirs.
-
-Close: Concrete next step on its own line. Use a calibrated question ("What does your schedule look like...") not a vague closer.
-
-TONE: Conversational, confident, peer-to-peer. Use names and company names from the call. Every sentence must move things forward. If it doesn't, delete it.
-
-Sign off with "Best," then "{sender_name}".
-
-Respond with ONLY a JSON object (no markdown, no backticks). Use \\n for line breaks in the body:
-{{"subject": "...", "body": "Hi [name],\\n\\nGreat speaking earlier...\\n\\nBest,\\n{sender_name}"}}""".format(
+    prompt = (
+        "You are {sender_name}, a senior sales leader at Rokt. You just got off a call "
+        "and are writing a follow-up email.\n\n"
+        "MEETING DETAILS:\n"
+        "- Title: {title}\n"
+        "- Date: {date}\n"
+        "- To (external): {to}\n"
+        "- CC (internal Rokt): {cc}\n\n"
+        "MEETING CONTENT:\n"
+        "{notes}\n\n"
+        "The transcript is labeled with real speaker names ({sender_name} = you, "
+        "the other name = the external attendee). It is the sole source of truth "
+        "for who said what.\n\n"
+        "{gmail_section}"
+        "RULES:\n\n"
+        "1. LENGTH: 4-8 sentences total. No exceptions.\n\n"
+        "2. NO RESTATING. Both parties were on the call. Reference decisions and "
+        "commitments by name, don't re-explain them.\n\n"
+        "3. COMMITMENTS: Identify the single most important next step. You may add "
+        "one more if critical. Everything else gets cut. If there's a soft commitment "
+        "like meeting up in person, reconnecting for an intro, or a networking favor, "
+        "weave it in naturally as a brief mention, not a formal action item.\n\n"
+        "4. NO FLATTERY, NO THANK-YOUS. Zero. No \"appreciate you,\" no \"great effort,\" "
+        "no \"thanks for your time.\" Reference specifics, not adjectives.\n\n"
+        "5. TENSE: Future tense for things not yet done (\"I'll send\" not \"I sent\"). "
+        "Past tense only for things confirmed complete.\n\n"
+        "6. CONFIRMED PLANS: If a specific time was agreed on the call, state it as "
+        "confirmed (\"Talk Wednesday at 1pm\"). Do NOT re-ask.\n\n"
+        "7. NEVER FABRICATE. No case studies, stats, company names, or resources that "
+        "weren't explicitly said on the call. Do not invent commitments to share work, "
+        "get feedback, or loop someone in that weren't explicitly stated. If a next step "
+        "wasn't said out loud on the call, it doesn't go in the email. When in doubt, "
+        "leave it out.\n\n"
+        "8. NO EMDASHES. Use commas or periods.\n\n"
+        "SUBJECT LINE:\n"
+        "{subject_instruction}\n\n"
+        "STRUCTURE (flexible, not a rigid template):\n\n"
+        "- Open with \"Hi [first name],\" then a blank line. Default to \"Great speaking "
+        "earlier\" as your opener, then follow with something that reflects back their "
+        "situation or priority. You can occasionally vary the opener for long-standing "
+        "relationships where it would feel stale, but \"Great speaking earlier\" is your "
+        "go-to.\n"
+        "- Reference the key decision or agreement in one sentence.\n"
+        "- State your commitment(s) and any soft threads.\n"
+        "- Close with a concrete next step. If a time is confirmed, just confirm it. "
+        "If nothing was set, propose something specific.\n\n"
+        "TONE: Write like you're texting a business friend, not drafting a memo. "
+        "Short sentences. Conversational. Confident. Use first names and company "
+        "names from the call. If something was casual on the call, keep it casual "
+        "in the email.\n\n"
+        'Sign off with "Best," then "{sender_name}" on the next line.\n\n'
+        "Respond with ONLY a JSON object (no markdown, no backticks). Use \\n for "
+        "line breaks in the body:\n"
+        '{{"subject": "...", "body": "Hi [name],\\n\\n...\\n\\nBest,\\n{sender_name}"}}'
+    ).format(
         title=meeting_data["title"],
         date=date_str,
         to=", ".join(recipients["to"]),
         cc=", ".join(recipients["cc"]),
         notes=meeting_data["notes"][:20000],
         sender_name=sender_name,
+        gmail_section=gmail_section,
+        subject_instruction=(
+            "Adapt the subject line to the relationship and topic. Reference the "
+            "company name or topic discussed. Example: \"re: Rokt x [Company]\" or "
+            "\"re: [topic] follow-up\". Keep it short and natural."
+            if has_recent_history else
+            "Use \"re: our call today (Rokt)\" as the subject line."
+        ),
     )
 
     try:
@@ -741,11 +871,166 @@ Respond with ONLY a JSON object (no markdown, no backticks). Use \\n for line br
 # ---------------------------------------------------------------------------
 # GMAIL API
 # ---------------------------------------------------------------------------
+def get_gmail_service():
+    """Build and return an authenticated Gmail API service object."""
+    try:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request as GRequest
+        from googleapiclient.discovery import build
+    except ImportError:
+        log.error("Google API packages not installed.")
+        return None
+
+    creds = None
+    if GMAIL_TOKEN.exists():
+        creds = Credentials.from_authorized_user_file(str(GMAIL_TOKEN))
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(GRequest())
+                GMAIL_TOKEN.write_text(creds.to_json())
+            except Exception as e:
+                log.error("Failed to refresh Gmail token: %s", e)
+                return None
+        else:
+            log.error("No valid Gmail token.")
+            return None
+
+    try:
+        return build("gmail", "v1", credentials=creds)
+    except Exception as e:
+        log.error("Failed to build Gmail service: %s", e)
+        return None
+
+
+def fetch_gmail_context(external_emails, days_back=GMAIL_LOOKBACK_DAYS,
+                        max_messages=GMAIL_MAX_MESSAGES):
+    """Fetch recent email activity with external contacts from Gmail."""
+    if not external_emails:
+        return ""
+
+    service = get_gmail_service()
+    if not service:
+        log.warning("Gmail service unavailable — skipping email context")
+        return ""
+
+    all_messages = []
+
+    for email_addr in external_emails:
+        query = "from:{e} OR to:{e} newer_than:{d}d -in:drafts".format(
+            e=email_addr, d=days_back
+        )
+        try:
+            results = service.users().messages().list(
+                userId="me",
+                q=query,
+                maxResults=max_messages,
+            ).execute()
+            message_ids = results.get("messages", [])
+        except Exception as e:
+            log.warning("Gmail search failed for %s: %s", email_addr, e)
+            continue
+
+        if not message_ids:
+            log.info("  No email history with %s (last %d days)", email_addr, days_back)
+            continue
+
+        log.info("  Found %d emails with %s", len(message_ids), email_addr)
+
+        for msg_ref in message_ids:
+            try:
+                msg = service.users().messages().get(
+                    userId="me",
+                    id=msg_ref["id"],
+                    format="metadata",
+                    metadataHeaders=["From", "To", "Subject", "Date"],
+                ).execute()
+
+                headers = {
+                    h["name"]: h["value"]
+                    for h in msg.get("payload", {}).get("headers", [])
+                }
+                snippet = msg.get("snippet", "")
+
+                from_addr = headers.get("From", "")
+                from_lower = from_addr.lower()
+                if MY_EMAIL.lower() in from_lower:
+                    direction = "YOU \u2192"
+                    other = email_addr
+                else:
+                    direction = email_addr.split("@")[0] + " \u2192"
+                    other = "YOU"
+
+                date_str = headers.get("Date", "")
+                try:
+                    from email.utils import parsedate_to_datetime
+                    dt = parsedate_to_datetime(date_str)
+                    date_display = dt.strftime("%b %d")
+                except Exception:
+                    date_display = date_str[:10] if date_str else "?"
+
+                subject = headers.get("Subject", "(no subject)")
+
+                cal_prefixes = ("Invitation:", "Updated invitation:",
+                                "Accepted:", "Declined:", "Tentative:")
+                if subject.startswith(cal_prefixes):
+                    cal_noise = ("Join with Google Meet", "Join by phone",
+                                 "has accepted", "has declined", "has tentatively",
+                                 "meet.google.com", "zoom.us/j")
+                    if any(n in snippet for n in cal_noise):
+                        continue
+
+                all_messages.append({
+                    "timestamp": msg.get("internalDate", "0"),
+                    "date_display": date_display,
+                    "direction": direction,
+                    "other": other,
+                    "subject": subject,
+                    "snippet": snippet[:160],
+                    "email": email_addr,
+                })
+            except Exception as e:
+                log.debug("Failed to fetch message %s: %s", msg_ref["id"], e)
+                continue
+
+    if not all_messages:
+        return ""
+
+    all_messages.sort(key=lambda m: int(m["timestamp"]))
+
+    lines = []
+    for m in all_messages:
+        lines.append(
+            '{date} \u2014 {direction} {other}: "{subject}" \u2014 {snippet}'.format(
+                date=m["date_display"],
+                direction=m["direction"],
+                other=m["other"],
+                subject=m["subject"],
+                snippet=m["snippet"],
+            )
+        )
+
+    if all_messages:
+        last = all_messages[-1]
+        if "YOU \u2192" in last["direction"]:
+            lines.append("[last outbound message has no reply]")
+
+    header = (
+        "RECENT EMAIL ACTIVITY WITH {emails} (last {days} days, up to {n} messages):"
+    ).format(
+        emails=", ".join(external_emails),
+        days=days_back,
+        n=max_messages,
+    )
+    return header + "\n" + "\n".join(lines)
+
+
 def get_gmail_sender_name():
     """Get the user's display name from Gmail sendAs settings."""
     try:
         from google.oauth2.credentials import Credentials
-        from google.auth.transport.requests import Request
+        from google.auth.transport.requests import Request as GRequest
         from googleapiclient.discovery import build
     except ImportError:
         return None
@@ -757,7 +1042,7 @@ def get_gmail_sender_name():
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
-                creds.refresh(Request())
+                creds.refresh(GRequest())
                 GMAIL_TOKEN.write_text(creds.to_json())
             except Exception:
                 return None
@@ -771,7 +1056,7 @@ def get_gmail_sender_name():
             if alias.get("isPrimary"):
                 full_name = alias.get("displayName", "")
                 if full_name:
-                    return full_name.split()[0]  # First name only
+                    return full_name.split()[0]
         return None
     except Exception as e:
         log.warning("Could not get sender name from Gmail: %s", e)
@@ -781,7 +1066,7 @@ def get_gmail_sender_name():
 def create_gmail_draft(subject, body, to, cc):
     try:
         from google.oauth2.credentials import Credentials
-        from google.auth.transport.requests import Request
+        from google.auth.transport.requests import Request as GRequest
         from googleapiclient.discovery import build
         import base64
         from email.mime.text import MIMEText
@@ -796,7 +1081,7 @@ def create_gmail_draft(subject, body, to, cc):
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
-                creds.refresh(Request())
+                creds.refresh(GRequest())
                 GMAIL_TOKEN.write_text(creds.to_json())
             except Exception as e:
                 log.error("Failed to refresh Gmail token: %s", e)
@@ -828,7 +1113,7 @@ def create_gmail_draft(subject, body, to, cc):
 # PROCESS A SINGLE MEETING
 # ---------------------------------------------------------------------------
 def process_meeting(doc, token):
-    """Process one meeting: fetch notes, generate email, create draft.
+    """Process one meeting: fetch notes via API, generate email, create draft.
 
     Returns: 'success', 'deferred', 'skipped', or 'failed'
     """
@@ -836,7 +1121,6 @@ def process_meeting(doc, token):
     log.info("Processing: %s | Date: %s | Attendees: %d",
              meeting["title"], meeting["date"], len(meeting["attendees"]))
 
-    # Check external
     if not is_external_meeting(meeting["attendees"]):
         log.info("  Internal meeting — skipping")
         if meeting["id"]:
@@ -852,16 +1136,32 @@ def process_meeting(doc, token):
 
     log.info("  External meeting. To: %s, CC: %s", recipients["to"], recipients["cc"])
 
-    # Fetch panels from Granola API (with retry)
+    # Determine speaker names for transcript labeling
+    # "microphone" = the Granola user (you), "system" = other participant(s)
+    sender_name_for_transcript = get_gmail_sender_name() or "Matthew"
+    external_names = [a["name"] for a in meeting["attendees"]
+                      if a.get("email", "").lower() not in (MY_EMAIL.lower(), "")
+                      and not a.get("email", "").endswith("@" + INTERNAL_DOMAIN)]
+    if len(external_names) == 1:
+        their_name = external_names[0]
+    elif external_names:
+        their_name = " / ".join(external_names)
+    else:
+        their_name = "Them"
+
+    # Fetch panels + transcript from Granola API (with retry)
     log.info("  Fetching panels from Granola API...")
-    notes_text = fetch_panels_with_retry(meeting["id"], token)
+    notes_text = fetch_panels_with_retry(
+        meeting["id"], token,
+        my_name=sender_name_for_transcript,
+        their_name=their_name)
 
     if not notes_text:
-        log.warning("  Panels not ready — deferring for next trigger")
+        log.warning("  Panels/transcript not ready or no speaker separation — deferring")
         defer_meeting(meeting["id"])
         notify(
             "Meeting Follow-Up",
-            f"Notes not ready yet for: {meeting['title']}. Will retry.",
+            "Notes not ready yet for: %s. Will retry." % meeting["title"],
             sound="Purr",
         )
         return "deferred"
@@ -869,14 +1169,23 @@ def process_meeting(doc, token):
     meeting["notes"] = notes_text
     log.info("  Notes: %d chars", len(notes_text))
 
+    # Fetch Gmail context (Layer 2)
+    log.info("  Fetching Gmail context for external contacts...")
+    gmail_context = fetch_gmail_context(recipients["to"])
+    if gmail_context:
+        log.info("  Gmail context: %d chars", len(gmail_context))
+    else:
+        log.info("  No Gmail history found with these contacts")
+
     # Generate email
     sender_name = get_gmail_sender_name() or "Matthew"
-    email = generate_followup_email(meeting, recipients, sender_name=sender_name)
+    email = generate_followup_email(meeting, recipients, sender_name=sender_name,
+                                    gmail_context=gmail_context)
     if not email:
         log.error("  Failed to generate email")
         notify(
             "Meeting Follow-Up Failed",
-            f"Could not generate email for: {meeting['title']}",
+            "Could not generate email for: %s" % meeting["title"],
             sound="Basso",
         )
         return "failed"
@@ -894,7 +1203,7 @@ def process_meeting(doc, token):
         mark_processed(meeting["id"])
         notify(
             "Meeting Follow-Up",
-            f"Draft ready: {meeting['title']}",
+            "Draft ready: %s" % meeting["title"],
             sound="Glass",
         )
         return "success"
@@ -902,7 +1211,7 @@ def process_meeting(doc, token):
         log.error("  Failed to create Gmail draft")
         notify(
             "Meeting Follow-Up Failed",
-            f"Gmail draft failed for: {meeting['title']}",
+            "Gmail draft failed for: %s" % meeting["title"],
             sound="Basso",
         )
         return "failed"
@@ -915,7 +1224,6 @@ def main():
     log.info("=" * 50)
     log.info("Meeting follow-up triggered")
 
-    # --- Acquire lock (prevent concurrent runs) ---
     lock = LockFile(LOCK_FILE)
     if not lock.acquire():
         log.info("Another instance is running — exiting")
@@ -927,10 +1235,10 @@ def main():
 
 
 def _run():
-    # Short initial delay to let Granola finish writing cache metadata
+    # Short delay to let Granola finish writing cache metadata
     time.sleep(10)
 
-    # --- Step 1: Parse cache ---
+    # --- Step 1: Parse cache for metadata ---
     cache_state = parse_cache()
     if not cache_state:
         log.info("Could not parse cache — exiting")
@@ -945,7 +1253,6 @@ def _run():
     # --- Step 3: Collect meetings to process ---
     meetings_to_process = get_recent_meetings(cache_state)
 
-    # Add previously deferred meetings (panels weren't ready last time)
     deferred_docs = get_deferred_meeting_docs(cache_state)
     recent_ids = {d.get("id") for d in meetings_to_process}
     for doc in deferred_docs:
@@ -969,7 +1276,7 @@ def _run():
     if results["failed"] > 0:
         notify(
             "Meeting Follow-Up",
-            f"{results['failed']} email(s) failed. Check logs.",
+            "%d email(s) failed. Check logs." % results["failed"],
             sound="Basso",
         )
 
