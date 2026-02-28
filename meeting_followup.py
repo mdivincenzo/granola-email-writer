@@ -25,9 +25,7 @@ import glob
 import gzip
 import fcntl
 import logging
-import tempfile
 import subprocess
-from collections import deque
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from urllib.request import Request, urlopen
@@ -44,8 +42,6 @@ GRANOLA_TRANSCRIPT_URL = "https://api.granola.ai/v1/get-document-transcript"
 STATE_FILE = Path.home() / ".meeting-followup" / "state.json"
 LOG_FILE = Path.home() / ".meeting-followup" / "followup.log"
 LOCK_FILE = Path.home() / ".meeting-followup" / "run.lock"
-EVENTS_FILE = Path.home() / ".meeting-followup" / "events.jsonl"
-STATUS_FILE = Path.home() / ".meeting-followup" / "status.json"
 GMAIL_CREDENTIALS = Path.home() / ".gmail-mcp" / "credentials.json"
 GMAIL_TOKEN = Path.home() / ".gmail-mcp" / "token.json"
 
@@ -59,10 +55,7 @@ PANEL_POLL_MAX_WAIT = 300  # max seconds to wait (5 minutes)
 PANEL_MIN_CHARS = 50       # minimum content length to consider panels "ready"
 
 # Meeting age window
-MEETING_MAX_AGE_HOURS = 8  # process meetings up to this old
-
-# Claude model
-MODEL = "claude-sonnet-4-5-20250929"
+MEETING_MAX_AGE_HOURS = 96  # process meetings up to this old
 
 # Gmail context (Layer 2): pull recent email history with external contacts
 GMAIL_LOOKBACK_DAYS = 365  # search up to 12 months back
@@ -815,27 +808,20 @@ def generate_followup_email(meeting_data, recipients, sender_name="Matthew",
         "6. CONFIRMED PLANS: If a specific time was agreed on the call, state it as "
         "confirmed (\"Talk Wednesday at 1pm\"). Do NOT re-ask.\n\n"
         "7. NEVER FABRICATE. No case studies, stats, company names, or resources that "
-        "weren't explicitly said on the call. Do not invent commitments to share work, "
-        "get feedback, or loop someone in that weren't explicitly stated. If a next step "
-        "wasn't said out loud on the call, it doesn't go in the email. When in doubt, "
-        "leave it out.\n\n"
+        "weren't explicitly said on the call. When in doubt, leave it out.\n\n"
         "8. NO EMDASHES. Use commas or periods.\n\n"
         "SUBJECT LINE:\n"
         "{subject_instruction}\n\n"
         "STRUCTURE (flexible, not a rigid template):\n\n"
-        "- Open with \"Hi [first name],\" then a blank line. Default to \"Great speaking "
-        "earlier\" as your opener, then follow with something that reflects back their "
-        "situation or priority. You can occasionally vary the opener for long-standing "
-        "relationships where it would feel stale, but \"Great speaking earlier\" is your "
-        "go-to.\n"
+        "- Open with \"Hi [first name],\" then a blank line. Start with something that "
+        "reflects back their situation or priority from the call. Vary your openings "
+        "naturally, don't always use the same phrase.\n"
         "- Reference the key decision or agreement in one sentence.\n"
         "- State your commitment(s) and any soft threads.\n"
         "- Close with a concrete next step. If a time is confirmed, just confirm it. "
         "If nothing was set, propose something specific.\n\n"
-        "TONE: Write like you're texting a business friend, not drafting a memo. "
-        "Short sentences. Conversational. Confident. Use first names and company "
-        "names from the call. If something was casual on the call, keep it casual "
-        "in the email.\n\n"
+        "TONE: Conversational, confident, peer-to-peer. Use first names and company "
+        "names from the call. Every sentence must move things forward.\n\n"
         'Sign off with "Best," then "{sender_name}" on the next line.\n\n'
         "Respond with ONLY a JSON object (no markdown, no backticks). Use \\n for "
         "line breaks in the body:\n"
@@ -859,7 +845,7 @@ def generate_followup_email(meeting_data, recipients, sender_name="Matthew",
 
     try:
         response = client.messages.create(
-            model=MODEL,
+            model="claude-sonnet-4-5-20250929",
             max_tokens=1500,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -1071,7 +1057,6 @@ def get_gmail_sender_name():
 
 
 def create_gmail_draft(subject, body, to, cc):
-    """Create a Gmail draft. Returns draft ID string on success, None on failure."""
     try:
         from google.oauth2.credentials import Credentials
         from google.auth.transport.requests import Request as GRequest
@@ -1080,7 +1065,7 @@ def create_gmail_draft(subject, body, to, cc):
         from email.mime.text import MIMEText
     except ImportError:
         log.error("Google API packages not installed.")
-        return None
+        return False
 
     creds = None
     if GMAIL_TOKEN.exists():
@@ -1093,10 +1078,10 @@ def create_gmail_draft(subject, body, to, cc):
                 GMAIL_TOKEN.write_text(creds.to_json())
             except Exception as e:
                 log.error("Failed to refresh Gmail token: %s", e)
-                return None
+                return False
         else:
             log.error("No valid Gmail token.")
-            return None
+            return False
 
     try:
         service = build("gmail", "v1", credentials=creds)
@@ -1110,34 +1095,11 @@ def create_gmail_draft(subject, body, to, cc):
             userId="me",
             body={"message": {"raw": raw}},
         ).execute()
-        draft_id = draft["id"]
-        log.info("Draft created: ID %s", draft_id)
-        return draft_id
+        log.info("Draft created: ID %s", draft["id"])
+        return True
     except Exception as e:
         log.error("Gmail API error: %s", e)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# EVENT LOGGING (for status app)
-# ---------------------------------------------------------------------------
-def append_event(event_dict):
-    """Append a structured event to events.jsonl for the status app.
-
-    Each line is one JSON object. Failures are logged but never block the pipeline.
-    """
-    try:
-        now = datetime.now(timezone.utc)
-        event_dict.setdefault("timestamp", now.strftime("%Y-%m-%dT%H:%M:%SZ"))
-        if "id" not in event_dict:
-            short_id = event_dict.get("meeting_id", "unknown")[:8]
-            event_dict["id"] = "evt_%s_%s" % (
-                now.strftime("%Y%m%d_%H%M%S"), short_id
-            )
-        with open(EVENTS_FILE, "a") as f:
-            f.write(json.dumps(event_dict) + "\n")
-    except Exception as e:
-        log.debug("Failed to append event: %s", e)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1156,12 +1118,6 @@ def process_meeting(doc, token):
         log.info("  Internal meeting — skipping")
         if meeting["id"]:
             mark_processed(meeting["id"])
-        append_event({
-            "type": "skipped",
-            "meeting_id": meeting["id"],
-            "title": meeting["title"],
-            "reason": "Internal meeting (all @%s)" % INTERNAL_DOMAIN,
-        })
         return "skipped"
 
     recipients = get_recipients(meeting["attendees"])
@@ -1169,12 +1125,6 @@ def process_meeting(doc, token):
         log.warning("  No external email addresses — skipping")
         if meeting["id"]:
             mark_processed(meeting["id"])
-        append_event({
-            "type": "skipped",
-            "meeting_id": meeting["id"],
-            "title": meeting["title"],
-            "reason": "No external email addresses",
-        })
         return "skipped"
 
     log.info("  External meeting. To: %s, CC: %s", recipients["to"], recipients["cc"])
@@ -1207,36 +1157,23 @@ def process_meeting(doc, token):
             "Notes not ready yet for: %s. Will retry." % meeting["title"],
             sound="Purr",
         )
-        append_event({
-            "type": "deferred",
-            "meeting_id": meeting["id"],
-            "title": meeting["title"],
-            "to": recipients["to"],
-            "cc": recipients["cc"],
-            "reason": "Panels/transcript not ready or no speaker separation",
-        })
         return "deferred"
 
     meeting["notes"] = notes_text
-    transcript_chars = len(notes_text)
-    log.info("  Notes: %d chars", transcript_chars)
+    log.info("  Notes: %d chars", len(notes_text))
 
     # Fetch Gmail context (Layer 2)
     log.info("  Fetching Gmail context for external contacts...")
     gmail_context = fetch_gmail_context(recipients["to"])
-    gmail_context_chars = len(gmail_context)
     if gmail_context:
-        log.info("  Gmail context: %d chars", gmail_context_chars)
+        log.info("  Gmail context: %d chars", len(gmail_context))
     else:
         log.info("  No Gmail history found with these contacts")
 
-    # Generate email (with timing)
+    # Generate email
     sender_name = get_gmail_sender_name() or "Matthew"
-    t0 = time.time()
     email = generate_followup_email(meeting, recipients, sender_name=sender_name,
                                     gmail_context=gmail_context)
-    generation_time = round(time.time() - t0, 1)
-
     if not email:
         log.error("  Failed to generate email")
         notify(
@@ -1244,24 +1181,17 @@ def process_meeting(doc, token):
             "Could not generate email for: %s" % meeting["title"],
             sound="Basso",
         )
-        append_event({
-            "type": "failed",
-            "meeting_id": meeting["id"],
-            "title": meeting["title"],
-            "to": recipients["to"],
-            "reason": "Claude API failed to generate email",
-        })
         return "failed"
 
     # Create Gmail draft
-    draft_id = create_gmail_draft(
+    success = create_gmail_draft(
         subject=email["subject"],
         body=email["body"],
         to=recipients["to"],
         cc=recipients["cc"],
     )
 
-    if draft_id:
+    if success:
         log.info("  Draft created in Gmail")
         mark_processed(meeting["id"])
         notify(
@@ -1269,18 +1199,6 @@ def process_meeting(doc, token):
             "Draft ready: %s" % meeting["title"],
             sound="Glass",
         )
-        append_event({
-            "type": "success",
-            "meeting_id": meeting["id"],
-            "title": meeting["title"],
-            "to": recipients["to"],
-            "cc": recipients["cc"],
-            "subject": email["subject"],
-            "transcript_chars": transcript_chars,
-            "gmail_context_chars": gmail_context_chars,
-            "generation_time_sec": generation_time,
-            "draft_id": draft_id,
-        })
         return "success"
     else:
         log.error("  Failed to create Gmail draft")
@@ -1289,174 +1207,7 @@ def process_meeting(doc, token):
             "Gmail draft failed for: %s" % meeting["title"],
             sound="Basso",
         )
-        append_event({
-            "type": "failed",
-            "meeting_id": meeting["id"],
-            "title": meeting["title"],
-            "to": recipients["to"],
-            "reason": "Gmail draft creation failed",
-        })
         return "failed"
-
-
-# ---------------------------------------------------------------------------
-# STATUS WRITER (for Follow-Up status app)
-# ---------------------------------------------------------------------------
-def _check_health(name, check_fn):
-    """Run a single health check, returning a status dict."""
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    try:
-        status, detail = check_fn()
-        return {"status": status, "detail": detail, "checked_at": now}
-    except Exception as e:
-        return {"status": "error", "detail": str(e), "checked_at": now}
-
-
-def run_health_checks():
-    """Run all system health checks. Returns dict of check name -> result."""
-    checks = {}
-
-    # LaunchAgent
-    def check_launchagent():
-        result = subprocess.run(
-            ["launchctl", "list"], capture_output=True, text=True, timeout=5,
-        )
-        if "meeting-followup" in result.stdout:
-            return "ok", "Loaded and running"
-        return "error", "Not loaded — LaunchAgent may need reinstall"
-    checks["launchagent"] = _check_health("launchagent", check_launchagent)
-
-    # Granola cache (last meeting recorded)
-    def check_granola_cache():
-        cache_path = find_granola_cache()
-        if not cache_path or not cache_path.exists():
-            return "error", "Cache file not found"
-        mtime = os.path.getmtime(cache_path)
-        age_min = (time.time() - mtime) / 60
-        if age_min < 60:
-            return "ok", "%d min ago" % int(age_min)
-        age_hr = age_min / 60
-        if age_hr < 24:
-            return "ok", "%.0f hrs ago" % age_hr
-        age_days = age_hr / 24
-        return "ok", "%.0f days ago" % age_days
-    checks["granola_cache"] = _check_health("granola_cache", check_granola_cache)
-
-    # Granola token
-    def check_granola_token():
-        if not GRANOLA_AUTH.exists():
-            return "error", "supabase.json not found"
-        data = json.loads(GRANOLA_AUTH.read_text())
-        wt = data.get("workos_tokens", "{}")
-        tokens = json.loads(wt) if isinstance(wt, str) else wt
-        if tokens.get("access_token"):
-            return "ok", "Token present"
-        return "error", "No access_token in auth file"
-    checks["granola_token"] = _check_health("granola_token", check_granola_token)
-
-    # Gmail credentials
-    def check_gmail_creds():
-        if not GMAIL_TOKEN.exists():
-            return "error", "token.json not found at %s" % GMAIL_TOKEN
-        data = json.loads(GMAIL_TOKEN.read_text())
-        if data.get("token"):
-            return "ok", "Authenticated"
-        return "warning", "Token file exists but may be invalid"
-    checks["gmail_creds"] = _check_health("gmail_creds", check_gmail_creds)
-
-    # Anthropic API key
-    def check_anthropic_key():
-        key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if key:
-            return "ok", "API key set (%d chars)" % len(key)
-        return "error", "ANTHROPIC_API_KEY not set"
-    checks["anthropic_key"] = _check_health("anthropic_key", check_anthropic_key)
-
-    # Lock file
-    def check_lock_file():
-        if not LOCK_FILE.exists():
-            return "ok", "No lock file"
-        try:
-            pid = int(LOCK_FILE.read_text().strip())
-            # Check if the PID is still alive
-            os.kill(pid, 0)
-            return "ok", "Pipeline running (PID %d)" % pid
-        except (ValueError, ProcessLookupError, PermissionError):
-            age_min = (time.time() - os.path.getmtime(LOCK_FILE)) / 60
-            if age_min > 10:
-                return "warning", "Stale lock file (%.0f min old)" % age_min
-            return "ok", "No stale lock"
-    checks["lock_file"] = _check_health("lock_file", check_lock_file)
-
-    return checks
-
-
-def write_status():
-    """Write status.json for the Follow-Up status app.
-
-    Collects health checks, recent events, and config into a single JSON file.
-    Written atomically (temp file + rename) so the app never reads partial data.
-    """
-    # Health checks
-    health = run_health_checks()
-
-    # Recent events from events.jsonl
-    events = []
-    try:
-        if EVENTS_FILE.exists():
-            with open(EVENTS_FILE, "r") as f:
-                recent_lines = deque(f, maxlen=50)
-            for line in recent_lines:
-                line = line.strip()
-                if line:
-                    events.append(json.loads(line))
-    except Exception as e:
-        log.debug("Failed to read events: %s", e)
-
-    # Config snapshot
-    config = {
-        "meeting_max_age_hours": MEETING_MAX_AGE_HOURS,
-        "internal_domain": INTERNAL_DOMAIN,
-        "model": MODEL,
-        "script_path": str(Path.home() / ".meeting-followup" / "meeting_followup2.py"),
-    }
-
-    status = {
-        "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "health": health,
-        "config": config,
-        "events": events,
-    }
-
-    # Write atomically
-    STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(STATUS_FILE.parent), suffix=".tmp"
-    )
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(status, f, indent=2)
-        os.rename(tmp_path, str(STATUS_FILE))
-        log.info("Status written to %s", STATUS_FILE)
-    except Exception:
-        # Clean up temp file if rename failed
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-
-    # Rotate events.jsonl if it's too large (>500 lines -> keep last 200)
-    try:
-        if EVENTS_FILE.exists():
-            with open(EVENTS_FILE, "r") as f:
-                all_lines = f.readlines()
-            if len(all_lines) > 500:
-                with open(EVENTS_FILE, "w") as f:
-                    f.writelines(all_lines[-200:])
-                log.info("Rotated events.jsonl: %d -> 200 lines", len(all_lines))
-    except Exception as e:
-        log.debug("Failed to rotate events: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -1484,20 +1235,12 @@ def _run():
     cache_state = parse_cache()
     if not cache_state:
         log.info("Could not parse cache — exiting")
-        try:
-            write_status()
-        except Exception as e:
-            log.warning("Failed to write status: %s", e)
         return
 
     # --- Step 2: Get valid Granola token ---
     token = get_valid_granola_token()
     if not token:
         log.error("Cannot get valid Granola token — exiting")
-        try:
-            write_status()
-        except Exception as e:
-            log.warning("Failed to write status: %s", e)
         return
 
     # --- Step 3: Collect meetings to process ---
@@ -1511,21 +1254,9 @@ def _run():
 
     if not meetings_to_process:
         log.info("No meetings to process — exiting")
-        try:
-            write_status()
-        except Exception as e:
-            log.warning("Failed to write status: %s", e)
         return
 
     log.info("Processing %d meeting(s)", len(meetings_to_process))
-
-    # Log trigger event
-    append_event({
-        "type": "trigger",
-        "detail": "Cache file changed — %d meetings in %dhr window" % (
-            len(meetings_to_process), MEETING_MAX_AGE_HOURS
-        ),
-    })
 
     # --- Step 4: Process each meeting ---
     results = {"success": 0, "deferred": 0, "skipped": 0, "failed": 0}
@@ -1541,12 +1272,6 @@ def _run():
             "%d email(s) failed. Check logs." % results["failed"],
             sound="Basso",
         )
-
-    # Write status for the Follow-Up app
-    try:
-        write_status()
-    except Exception as e:
-        log.warning("Failed to write status: %s", e)
 
 
 if __name__ == "__main__":

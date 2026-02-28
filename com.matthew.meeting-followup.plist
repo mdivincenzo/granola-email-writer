@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>/Users/matthewdivincenzo/.meeting-followup/meeting_followup.py</string>
+        <string>YOUR_HOME_DIR/.meeting-followup/meeting_followup.py</string>
     </array>
 
     <key>EnvironmentVariables</key>
@@ -19,20 +19,22 @@
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
     </dict>
 
-    <!-- Trigger when Granola cache file is modified (i.e., meeting ends) -->
+    <!-- Watch the Granola data directory (not a specific versioned file).
+         Fires when any cache-v*.json is written, so Granola upgrades
+         (v3 → v4 → v5) don't require plist changes. -->
     <key>WatchPaths</key>
     <array>
-        <string>/Users/matthewdivincenzo/Library/Application Support/Granola/cache-v3.json</string>
+        <string>YOUR_HOME_DIR/Library/Application Support/Granola</string>
     </array>
 
-    <!-- Throttle: don't fire more than once every 30 seconds -->
+    <!-- Don't fire more than once every 30 seconds -->
     <key>ThrottleInterval</key>
     <integer>30</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/matthewdivincenzo/.meeting-followup/launchagent-stdout.log</string>
+    <string>YOUR_HOME_DIR/.meeting-followup/launchagent-stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/matthewdivincenzo/.meeting-followup/launchagent-stderr.log</string>
+    <string>YOUR_HOME_DIR/.meeting-followup/launchagent-stderr.log</string>
 
     <key>RunAtLoad</key>
     <false/>
